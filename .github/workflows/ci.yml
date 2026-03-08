@@ -2,14 +2,13 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   pull_request:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    environment: ci-approval
 
     steps:
       - name: Checkout
@@ -20,17 +19,35 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             cmake \
             ninja-build \
             build-essential \
             lua5.4 \
             liblua5.4-dev \
-            python3 \
-            clang
+            clang \
+            ccache
+
+      - name: Setup compiler env
+        run: |
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-${{ github.ref }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --parallel
