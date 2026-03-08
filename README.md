@@ -2,11 +2,6 @@
 
 Lua bindings for [ggml](./ggml/) built as a Lua C module (`ggml.so`).
 
-This repository vendors `ggml` and adds:
-- a minimal Lua module entrypoint in `lua_ggml.c`
-- auto-generated Lua wrappers and enum constants for `ggml_*` APIs
-- CMake-based build and a Lua smoke test
-
 ## Status
 
 This project currently uses `lightuserdata`/raw pointers for `ggml_context*` and `ggml_tensor*`.
@@ -67,9 +62,7 @@ It currently scans these headers:
 - `ggml/include/ggml.h`
 - `ggml/include/ggml-backend.h`
 - `ggml/include/ggml-cpu.h`
-
-It also supports simple by-value struct marshaling for supported records such as `ggml_init_params`, so APIs like `ggml.init(16 * 1024 * 1024)` can remain generated instead of hand-written.
-
+  
 
 ## License
 
