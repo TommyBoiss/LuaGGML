@@ -21,6 +21,9 @@ It is fast and minimal, but does not yet provide high-level Lua memory ownership
 - `clang` CLI (for JSON AST parsing in the binding generator)
 
 ## Build
+```bash
+git submodule update --init --recursive
+```
 
 ```bash
 cmake -S . -B build
