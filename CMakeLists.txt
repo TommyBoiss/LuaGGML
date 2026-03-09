@@ -23,9 +23,38 @@ if (LUA_GGML_AUTO_BINDINGS)
 
     set(LUA_GGML_BINDINGS_HEADERS
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml-alloc.h
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml-backend.h
         ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml-cpu.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/gguf.h
     )
+
+    set(LUA_GGML_OPTIONAL_BINDING_TARGETS
+        ggml-blas
+        ggml-cann
+        ggml-cuda
+        ggml-hexagon
+        ggml-hip
+        ggml-metal
+        ggml-musa
+        ggml-opencl
+        ggml-rpc
+        ggml-sycl
+        ggml-virtgpu
+        ggml-vulkan
+        ggml-webgpu
+        ggml-zdnn
+        ggml-zendnn
+    )
+
+    foreach(optional_target IN LISTS LUA_GGML_OPTIONAL_BINDING_TARGETS)
+        if (TARGET ${optional_target})
+            set(optional_header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/${optional_target}.h)
+            if (EXISTS ${optional_header})
+                list(APPEND LUA_GGML_BINDINGS_HEADERS ${optional_header})
+            endif()
+        endif()
+    endforeach()
 
     set(LUA_GGML_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
     set(LUA_GGML_GENERATED_C ${LUA_GGML_GENERATED_DIR}/lua_ggml_bindings.c)
@@ -33,8 +62,13 @@ if (LUA_GGML_AUTO_BINDINGS)
 
     set(LUA_GGML_GENERATOR_ARGS
         --header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml.h
+        --header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml-alloc.h
         --header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml-backend.h
         --header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/ggml-cpu.h
+        --header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/gguf.h
+        --prefix ggml_
+        --prefix gguf_
+        --strip-prefix ggml_
         --out-c ${LUA_GGML_GENERATED_C}
         --out-h ${LUA_GGML_GENERATED_H}
         --clang-bin ${CLANG_EXECUTABLE}
@@ -46,6 +80,16 @@ if (LUA_GGML_AUTO_BINDINGS)
     if (TARGET ggml-cpu)
         list(APPEND LUA_GGML_GENERATOR_ARGS --nm-library $<TARGET_FILE:ggml-cpu>)
     endif()
+
+    foreach(optional_target IN LISTS LUA_GGML_OPTIONAL_BINDING_TARGETS)
+        if (TARGET ${optional_target})
+            set(optional_header ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include/${optional_target}.h)
+            if (EXISTS ${optional_header})
+                list(APPEND LUA_GGML_GENERATOR_ARGS --header ${optional_header})
+            endif()
+            list(APPEND LUA_GGML_GENERATOR_ARGS --nm-library $<TARGET_FILE:${optional_target}>)
+        endif()
+    endforeach()
 
     add_custom_command(
         OUTPUT ${LUA_GGML_GENERATED_C} ${LUA_GGML_GENERATED_H}
@@ -83,11 +127,17 @@ endif()
 
 if (LUA_GGML_AUTO_BINDINGS)
     add_dependencies(lua_ggml lua_ggml_generate_bindings)
-    target_include_directories(lua_ggml PRIVATE ${LUA_GGML_GENERATED_DIR})
+    target_include_directories(lua_ggml PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${LUA_GGML_GENERATED_DIR})
     target_compile_definitions(lua_ggml PRIVATE LUA_GGML_HAS_GENERATED_BINDINGS=1)
 else()
     target_compile_definitions(lua_ggml PRIVATE LUA_GGML_HAS_GENERATED_BINDINGS=0)
 endif()
+
+foreach(optional_target IN LISTS LUA_GGML_OPTIONAL_BINDING_TARGETS)
+    if (TARGET ${optional_target})
+        target_link_libraries(lua_ggml PRIVATE ${optional_target})
+    endif()
+endforeach()
 
 if (TARGET Lua::Lua)
     target_link_libraries(lua_ggml PRIVATE Lua::Lua)

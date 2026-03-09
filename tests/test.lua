@@ -18,15 +18,41 @@ assert(type(ggml.new_tensor_2d) == "function", "ggml.new_tensor_2d should be ava
 assert(type(ggml.mul_mat) == "function", "ggml.mul_mat should be available")
 assert(type(ggml.new_graph) == "function", "ggml.new_graph should be available")
 assert(type(ggml.build_forward_expand) == "function", "ggml.build_forward_expand should be available")
+assert(type(ggml.build_forward_select) == "function", "ggml.build_forward_select should be available")
 assert(type(ggml.graph_compute_with_ctx) == "function", "ggml.graph_compute_with_ctx should be available")
+assert(type(ggml.graph_nodes) == "function", "ggml.graph_nodes should be available")
+assert(type(ggml.graph_plan) == "function", "ggml.graph_plan should be available")
+assert(type(ggml.backend_sched_new) == "function", "ggml.backend_sched_new should be available")
 assert(type(ggml.set_f32_1d) == "function", "ggml.set_f32_1d should be available")
 assert(type(ggml.get_f32_1d) == "function", "ggml.get_f32_1d should be available")
+assert(type(ggml.tensor_set_data) == "function", "ggml.tensor_set_data should be available")
+assert(type(ggml.tensor_get_data) == "function", "ggml.tensor_get_data should be available")
+assert(type(ggml.threadpool_params_default) == "function", "ggml.threadpool_params_default should be available")
+assert(type(ggml.threadpool_params_init) == "function", "ggml.threadpool_params_init should be available")
+assert(type(ggml.threadpool_params_match) == "function", "ggml.threadpool_params_match should be available")
+assert(type(ggml.threadpool_new) == "function", "ggml.threadpool_new should be available")
+assert(type(ggml.format_name) == "function", "ggml.format_name should be available")
+assert(type(ggml.fp32_to_bf16) == "function", "ggml.fp32_to_bf16 should be available")
+assert(type(ggml.bf16_to_fp32) == "function", "ggml.bf16_to_fp32 should be available")
+assert(type(ggml.pointer_ref) == "function", "ggml.pointer_ref should be available")
+assert(type(ggml.gguf_init_empty) == "function", "ggml.gguf_init_empty should be available")
+assert(type(ggml.gguf_init_from_file) == "function", "ggml.gguf_init_from_file should be available")
+assert(type(ggml.gguf_find_key) == "function", "ggml.gguf_find_key should be available")
+assert(type(ggml.gguf_get_kv_type) == "function", "ggml.gguf_get_kv_type should be available")
+assert(type(ggml.gguf_get_arr_n) == "function", "ggml.gguf_get_arr_n should be available")
+assert(type(ggml.gguf_get_arr_str) == "function", "ggml.gguf_get_arr_str should be available")
+assert(type(ggml.gguf_set_arr_str) == "function", "ggml.gguf_set_arr_str should be available")
 assert(type(ggml.TYPE_F32) == "number", "ggml.TYPE_F32 constant should be available")
 assert(type(ggml.STATUS_SUCCESS) == "number", "ggml.STATUS_SUCCESS constant should be available")
+assert(type(ggml.GGUF_TYPE_ARRAY) == "number", "ggml.GGUF_TYPE_ARRAY constant should be available")
+assert(type(ggml.GGUF_TYPE_STRING) == "number", "ggml.GGUF_TYPE_STRING constant should be available")
 
 local mem_size = 16 * 1024 * 1024 -- 16 MiB
 local ctx = ggml.init(mem_size)
 assert(type(ctx) == "userdata", "ggml.init should return userdata")
+assert(ctx:is_owned(), "ggml.init should return an owned handle")
+assert(not ctx:is_null(), "new context handle should not be null")
+assert(ctx:type_name() == "struct ggml_context *", "context handle should expose its type name")
 
 -- Matrix setup copied from the C++ ggml matmul example.
 -- A is 4x2, B is 3x2; ggml_mul_mat(A, B) computes A * B^T and stores
@@ -50,6 +76,9 @@ local matrix_B = {
 local a = ggml.new_tensor_2d(ctx, ggml.TYPE_F32, cols_A, rows_A)
 local b = ggml.new_tensor_2d(ctx, ggml.TYPE_F32, cols_B, rows_B)
 
+assert(type(a) == "userdata", "tensor results should also be userdata handles")
+assert(a:shape()[1] == cols_A and a:shape()[2] == rows_A, "tensor shape() should expose dimensions")
+
 for i, v in ipairs(matrix_A) do
     ggml.set_f32_1d(a, i - 1, v)
 end
@@ -58,12 +87,25 @@ for i, v in ipairs(matrix_B) do
     ggml.set_f32_1d(b, i - 1, v)
 end
 
+ggml.format_name(a, "matrix_%d", 1)
+assert(a:name() == "matrix_1", "format_name should set the tensor name")
+
 local result = ggml.mul_mat(ctx, a, b)
 local gf = ggml.new_graph(ctx)
 ggml.build_forward_expand(gf, result)
 
+local nodes = ggml.graph_nodes(gf)
+assert(type(nodes) == "table" and #nodes >= 1, "graph_nodes should return a non-empty table")
+assert(type(nodes[1]) == "userdata", "graph_nodes entries should be userdata handles")
+
 local status = ggml.graph_compute_with_ctx(ctx, gf, 1)
 assert(status == ggml.STATUS_SUCCESS, "graph_compute_with_ctx failed with status " .. tostring(status))
+
+local cplan = ggml.graph_plan(gf, 1)
+assert(type(cplan) == "userdata", "graph_plan should return cplan userdata")
+assert(cplan:work_size() >= 0, "cplan should expose work_size")
+local status_plan = ggml.graph_compute(gf, cplan)
+assert(status_plan == ggml.STATUS_SUCCESS, "graph_compute failed with status " .. tostring(status_plan))
 
 local expected = {
     60.0, 55.0, 50.0, 110.0,
@@ -77,10 +119,78 @@ for i, want in ipairs(expected) do
     assert(delta < 1e-5, string.format("matmul mismatch at index %d: got %.6f want %.6f", i - 1, got, want))
 end
 
+local raw_bytes = result:get_data(0, 3 * 4)
+assert(type(raw_bytes) == "string" and #raw_bytes == 12, "tensor:get_data should return raw bytes")
+
+local i32_tensor = ggml.new_tensor_1d(ctx, ggml.TYPE_I32, 2)
+i32_tensor:set_data(string.pack("<i4i4", 123, 456))
+assert(ggml.get_i32_1d(i32_tensor, 0) == 123, "set_data should write I32 tensor payloads")
+assert(ggml.get_i32_1d(i32_tensor, 1) == 456, "set_data should write I32 tensor payloads")
+
+local bf16_bits = ggml.fp32_to_bf16(1.5)
+local bf16_roundtrip = ggml.bf16_to_fp32(bf16_bits)
+assert(math.abs(bf16_roundtrip - 1.5) < 0.02, "bf16 conversion helpers should roundtrip approximately")
+
+local threadpool_params = ggml.threadpool_params_default(1)
+assert(type(threadpool_params) == "table", "threadpool_params_default should return a table")
+assert(threadpool_params.n_threads == 1, "threadpool_params_default should initialize n_threads")
+assert(type(threadpool_params.cpumask) == "table", "threadpool_params_default should expose cpumask as a Lua table")
+
+local init_result = ggml.threadpool_params_init(threadpool_params, 2)
+assert(init_result == nil, "threadpool_params_init should follow the C API and return no value")
+assert(threadpool_params.n_threads == 2, "threadpool_params_init should update the passed table in place")
+local default_two_threads = ggml.threadpool_params_default(2)
+assert(ggml.threadpool_params_match(threadpool_params, default_two_threads), "threadpool_params_match should accept Lua tables")
+
+local threadpool = ggml.threadpool_new(threadpool_params)
+assert(type(threadpool) == "userdata", "threadpool_new should return userdata")
+assert(threadpool:is_owned(), "threadpool handles should be owned")
+ggml.threadpool_free(threadpool)
+assert(threadpool:is_null(), "threadpool_free should invalidate the owned handle")
+
+local gguf = ggml.gguf_init_empty()
+assert(type(gguf) == "userdata", "gguf_init_empty should return userdata")
+ggml.gguf_set_arr_str(gguf, "labels", {"hello", "world"}, 2)
+local labels_key = ggml.gguf_find_key(gguf, "labels")
+assert(labels_key >= 0, "gguf_set_arr_str should create a retrievable key")
+assert(ggml.gguf_get_kv_type(gguf, labels_key) == ggml.GGUF_TYPE_ARRAY, "gguf_set_arr_str should create an array value")
+assert(ggml.gguf_get_arr_n(gguf, labels_key) == 2, "gguf_set_arr_str should preserve array length")
+assert(ggml.gguf_get_arr_str(gguf, labels_key, 0) == "hello", "gguf_set_arr_str should preserve the first string")
+assert(ggml.gguf_get_arr_str(gguf, labels_key, 1) == "world", "gguf_set_arr_str should preserve the second string")
+ggml.gguf_free(gguf)
+assert(gguf:is_null(), "gguf_free should invalidate the owned gguf handle")
+
 local ok_missing_arg, err_missing_arg = pcall(ggml.init)
 assert(not ok_missing_arg, "ggml.init() without args should fail")
 assert(type(err_missing_arg) == "string", "Expected an error string from invalid call")
 
+local ctx_ref = ggml.pointer_ref("struct ggml_context *")
+assert(ctx_ref:is_null(), "new pointer_ref should start null")
+assert(ctx_ref:type_name() == "struct ggml_context *", "pointer_ref should expose its pointee type")
+ctx_ref:set(ctx)
+assert(not ctx_ref:is_null(), "pointer_ref:set should store a pointer")
+local ctx_from_ref = ctx_ref:get(false)
+assert(type(ctx_from_ref) == "userdata", "pointer_ref:get should produce a pointer handle")
+assert(ctx_from_ref:type_name() == "struct ggml_context *", "pointer_ref:get should preserve pointee type")
+ctx_ref:clear()
+assert(ctx_ref:is_null(), "pointer_ref:clear should reset the pointer")
+
+local tmp_invalid_gguf = os.tmpname()
+local invalid_file = assert(io.open(tmp_invalid_gguf, "wb"))
+invalid_file:write("NOTGGUF")
+invalid_file:close()
+
+local gguf_ctx_ref = ggml.pointer_ref("struct ggml_context *")
+local gguf_ctx = ggml.gguf_init_from_file(tmp_invalid_gguf, {
+    no_alloc = false,
+    ctx = gguf_ctx_ref,
+})
+os.remove(tmp_invalid_gguf)
+assert(gguf_ctx == nil, "ggml.gguf_init_from_file should return nil on invalid files")
+assert(gguf_ctx_ref:is_null(), "ggml.gguf_init_from_file should leave ctx ref null on invalid files")
+
+assert(not ctx:is_null(), "context handle should remain valid before free")
 ggml.free(ctx)
+assert(ctx:is_null(), "ggml.free should invalidate the owned context handle")
 
 print("PASS: loaded ggml and validated matmul output")

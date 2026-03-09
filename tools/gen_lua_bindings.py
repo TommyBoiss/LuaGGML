@@ -19,11 +19,45 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import re
+
 EXCLUDED_BY_DEFAULT: set[str] = set()
 
 STRUCT_INTEGER_SHORTHANDS = {
     # Preserve the existing user-facing API: ggml.init(mem_size)
     "ggml_init_params": "mem_size",
+}
+
+POINTER_REF_TYPES = {
+    "void **": "void *",
+    "struct ggml_context **": "struct ggml_context *",
+}
+
+POINTER_ARRAY_TYPES = {
+    "const char **": ("string_array", "const char *"),
+    "struct ggml_tensor **": ("pointer_array", "struct ggml_tensor *"),
+    "const struct ggml_tensor * const *": ("pointer_array", "const struct ggml_tensor *"),
+    "ggml_backend_t *": ("pointer_array", "ggml_backend_t"),
+    "ggml_backend_buffer_type_t *": ("pointer_array", "ggml_backend_buffer_type_t"),
+}
+
+RECORD_POINTER_TYPES = {
+    "struct ggml_threadpool_params *": "ggml_threadpool_params",
+    "const struct ggml_threadpool_params *": "ggml_threadpool_params",
+}
+
+ALLOW_NIL_ARRAY_PARAMS = {
+    ("ggml_backend_sched_new", "bufts"),
+    ("ggml_build_backward_expand", "grad_accs"),
+}
+
+ARRAY_COUNT_PARAMS = {
+    ("ggml_backend_sched_new", "backends"): "n_backends",
+    ("ggml_backend_sched_new", "bufts"): "n_backends",
+    ("ggml_build_forward_select", "tensors"): "n_tensors",
+    ("ggml_backend_compare_graph_backend", "test_nodes"): "num_test_nodes",
+    ("ggml_gallocr_new_n", "bufts"): "n_bufs",
+    ("gguf_set_arr_str", "data"): "n",
 }
 
 INTEGER_NAMES = {
@@ -74,12 +108,36 @@ FLOAT_NAMES = {
     "long double",
 }
 
+OWNED_POINTER_RETURNS = {
+    "ggml_init",
+    "ggml_backend_alloc_buffer",
+    "ggml_backend_alloc_ctx_tensors",
+    "ggml_backend_alloc_ctx_tensors_from_buft",
+    "ggml_backend_buft_alloc_buffer",
+    "ggml_backend_cpu_buffer_from_ptr",
+    "ggml_backend_cpu_init",
+    "ggml_backend_dev_init",
+    "ggml_backend_event_new",
+    "ggml_backend_init_best",
+    "ggml_backend_init_by_name",
+    "ggml_backend_init_by_type",
+    "ggml_backend_sched_new",
+    "ggml_gallocr_new",
+    "ggml_gallocr_new_n",
+    "ggml_threadpool_new",
+    "gguf_init_empty",
+    "gguf_init_from_file",
+}
+
 
 @dataclass(frozen=True)
 class TypeInfo:
     kind: str
     c_spelling: str
     record_name: Optional[str] = None
+    pointee_c_spelling: Optional[str] = None
+    element_type: Optional["TypeInfo"] = None
+    array_length_expr: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -139,8 +197,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prefix",
-        default="ggml_",
-        help="Function prefix to include from headers",
+        action="append",
+        default=[],
+        help="Function prefix to include from headers (repeatable)",
+    )
+    parser.add_argument(
+        "--strip-prefix",
+        action="append",
+        default=[],
+        help="Function prefix to strip from the exported Lua name (repeatable)",
     )
     parser.add_argument(
         "--exclude",
@@ -155,6 +220,21 @@ def parse_args() -> argparse.Namespace:
         help="Built library to inspect for exported symbols (repeatable)",
     )
     return parser.parse_args()
+
+
+def longest_matching_prefix(name: str, prefixes: Sequence[str]) -> Optional[str]:
+    matches = [prefix for prefix in prefixes if name.startswith(prefix)]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def lua_name_for_symbol(c_name: str, strip_prefixes: Sequence[str]) -> str:
+    strip_prefix = longest_matching_prefix(c_name, strip_prefixes)
+    if strip_prefix is None:
+        return c_name
+    lua_name = c_name[len(strip_prefix) :]
+    return lua_name or c_name
 
 
 def normalize_path(path: str) -> str:
@@ -191,6 +271,35 @@ def resolve_alias_text(type_text: str, typedefs: Dict[str, str]) -> str:
         resolved = canonical_text(typedefs[resolved])
 
     return resolved
+
+
+def parse_fixed_array_type(type_text: str) -> Optional[Tuple[str, str]]:
+    match = re.match(r"^(.*)\[([^\]]+)\]$", type_text)
+    if match is None:
+        return None
+    return canonical_text(match.group(1)), canonical_text(match.group(2))
+
+
+def strip_one_pointer(type_text: str) -> Optional[str]:
+    stripped = canonical_text(type_text)
+    if not stripped.endswith("*"):
+        return None
+    return canonical_text(stripped[:-1])
+
+
+def extract_record_name(type_text: str) -> Optional[str]:
+    normalized = canonical_text(type_text)
+    normalized = re.sub(r"\bconst\b", "", normalized)
+    normalized = canonical_text(normalized)
+    if normalized.startswith("struct "):
+        return normalized.split(" ", 1)[1]
+    return None
+
+
+def walk_nodes(node: dict) -> Iterable[dict]:
+    yield node
+    for child in node.get("inner", []):
+        yield from walk_nodes(child)
 
 
 def collect_typedefs(ast_roots: Sequence[dict]) -> Dict[str, str]:
@@ -245,8 +354,16 @@ def classify_type(qual: str, desugared: str, typedefs: Dict[str, str]) -> Option
     if not qual_clean:
         return None
 
-    if "[" in qual_resolved or "[" in desugared_resolved:
-        return None
+    for candidate in (qual_resolved, desugared_resolved, qual_clean, desugared_clean):
+        array_parts = parse_fixed_array_type(candidate)
+        if array_parts is None:
+            continue
+
+        element_text, length_expr = array_parts
+        element_type = classify_type(element_text, element_text, typedefs)
+        if element_type is None or element_type.kind in {"fixed_array", "pointer_ref", "pointer_array", "string_array", "record_pointer"}:
+            return None
+        return TypeInfo("fixed_array", qual_clean, element_type=element_type, array_length_expr=length_expr)
 
     if qual_clean == "void":
         return TypeInfo("void", qual_clean)
@@ -261,9 +378,24 @@ def classify_type(qual: str, desugared: str, typedefs: Dict[str, str]) -> Option
         return None
 
     if "*" in desugared_resolved or "*" in qual_resolved:
+        for candidate in (qual_resolved, desugared_resolved, qual_clean, desugared_clean):
+            mapping = POINTER_ARRAY_TYPES.get(candidate)
+            if mapping is not None:
+                kind, pointee = mapping
+                return TypeInfo(kind, qual_clean, pointee_c_spelling=pointee)
+
         star_count = desugared_resolved.count("*") if "*" in desugared_resolved else qual_resolved.count("*")
         if star_count > 1:
+            if qual_resolved in POINTER_REF_TYPES:
+                return TypeInfo("pointer_ref", qual_clean, pointee_c_spelling=POINTER_REF_TYPES[qual_resolved])
+            if desugared_resolved in POINTER_REF_TYPES:
+                return TypeInfo("pointer_ref", qual_clean, pointee_c_spelling=POINTER_REF_TYPES[desugared_resolved])
             return None
+
+        for candidate in (qual_resolved, desugared_resolved, qual_clean, desugared_clean):
+            record_name = RECORD_POINTER_TYPES.get(candidate)
+            if record_name is not None:
+                return TypeInfo("record_pointer", qual_clean, record_name=record_name)
 
         no_space = desugared_resolved.replace(" ", "")
         if no_space in {"constchar*", "charconst*"}:
@@ -287,13 +419,6 @@ def classify_type(qual: str, desugared: str, typedefs: Dict[str, str]) -> Option
         return TypeInfo("number", qual_clean)
 
     return None
-
-
-def walk_nodes(node: dict) -> Iterable[dict]:
-    yield node
-    for child in node.get("inner", []):
-        yield from walk_nodes(child)
-
 
 def has_deprecated_attr(node: dict) -> bool:
     return any(child.get("kind") == "DeprecatedAttr" for child in node.get("inner", []))
@@ -353,6 +478,17 @@ def collect_record_candidates(ast_roots: Sequence[dict], typedefs: Dict[str, str
 def resolve_records(candidates: Dict[str, RecordInfo]) -> Dict[str, RecordInfo]:
     supported: Dict[str, RecordInfo] = {}
     progress = True
+    supported_field_kinds = {
+        "integer",
+        "enum",
+        "number",
+        "bool",
+        "string",
+        "pointer",
+        "pointer_ref",
+        "record",
+        "fixed_array",
+    }
 
     while progress:
         progress = False
@@ -362,6 +498,9 @@ def resolve_records(candidates: Dict[str, RecordInfo]) -> Dict[str, RecordInfo]:
 
             unresolved = False
             for field in record.fields:
+                if field.type_info.kind not in supported_field_kinds:
+                    unresolved = True
+                    break
                 if field.type_info.kind == "record" and field.type_info.record_name not in supported:
                     unresolved = True
                     break
@@ -377,13 +516,14 @@ def resolve_records(candidates: Dict[str, RecordInfo]) -> Dict[str, RecordInfo]:
 
 def analyze_function(
     fn_node: dict,
-    prefix: str,
+    prefixes: Sequence[str],
+    strip_prefixes: Sequence[str],
     excluded: set[str],
     records: Dict[str, RecordInfo],
     typedefs: Dict[str, str],
 ) -> Tuple[Optional[FuncInfo], Optional[str]]:
     c_name = fn_node.get("name", "")
-    if not c_name or not c_name.startswith(prefix):
+    if not c_name or longest_matching_prefix(c_name, prefixes) is None:
         return None, None
 
     if c_name in excluded:
@@ -404,6 +544,8 @@ def analyze_function(
     ret = classify_type(ret_qual, ret_desugared, typedefs)
     if ret is None:
         return None, f"unsupported return type '{ret_qual}'"
+    if ret.kind in {"fixed_array", "pointer_array", "string_array", "record_pointer"}:
+        return None, f"unsupported return type '{ret_qual}'"
     if ret.kind == "record" and ret.record_name not in records:
         return None, f"unsupported return type '{ret_qual}'"
 
@@ -418,15 +560,20 @@ def analyze_function(
             return None, f"unsupported param type '{p_qual}'"
         if mapped.kind == "record" and mapped.record_name not in records:
             return None, f"unsupported param type '{p_qual}'"
+        if mapped.kind == "record_pointer" and mapped.record_name not in records:
+            return None, f"unsupported param type '{p_qual}'"
+        if mapped.kind in {"pointer_array", "string_array"} and (c_name, get_param_name(param_node, i)) not in ARRAY_COUNT_PARAMS:
+            return None, f"unsupported param type '{p_qual}'"
         params.append(ParamInfo(get_param_name(param_node, i), mapped))
 
-    lua_name = c_name[len(prefix) :] or c_name
+    lua_name = lua_name_for_symbol(c_name, strip_prefixes)
     return FuncInfo(c_name, lua_name, ret, tuple(params)), None
 
 
 def find_functions(
     ast_roots: Sequence[dict],
-    prefix: str,
+    prefixes: Sequence[str],
+    strip_prefixes: Sequence[str],
     excluded: set[str],
     records: Dict[str, RecordInfo],
     typedefs: Dict[str, str],
@@ -445,7 +592,7 @@ def find_functions(
             if c_name and c_name in seen_supported:
                 continue
 
-            info, reason = analyze_function(node, prefix, excluded, records, typedefs)
+            info, reason = analyze_function(node, prefixes, strip_prefixes, excluded, records, typedefs)
             if info is None:
                 if reason and c_name and c_name not in seen_skipped:
                     skipped[reason] = skipped.get(reason, 0) + 1
@@ -508,7 +655,7 @@ def find_constants(ast_roots: Sequence[dict]) -> Tuple[List[ConstantInfo], Dict[
                 continue
 
             c_name = node.get("name", "")
-            if not c_name.startswith("GGML_") or c_name in constants:
+            if not (c_name.startswith("GGML_") or c_name.startswith("GGUF_")) or c_name in constants:
                 continue
 
             value = parse_constant_value(node)
@@ -527,6 +674,37 @@ def find_constants(ast_roots: Sequence[dict]) -> Tuple[List[ConstantInfo], Dict[
 
 def render_pointer_read_expr(c_type: str, index_expr: str, label: str) -> str:
     return f"({c_type}) lua_ggml_to_pointer(L, {index_expr}, \"{label}\")"
+
+
+def extra_indent(lines: Sequence[str], levels: int = 1) -> List[str]:
+    prefix = "    " * levels
+    return [prefix + line if line else "" for line in lines]
+
+
+def render_stack_value_assignment(type_info: TypeInfo, target_expr: str, stack_index_expr: str, label: str) -> List[str]:
+    c_type = type_info.c_spelling
+
+    if type_info.kind in {"integer", "enum"}:
+        return [f"{target_expr} = ({c_type}) luaL_checkinteger(L, {stack_index_expr});"]
+
+    if type_info.kind == "number":
+        return [f"{target_expr} = ({c_type}) luaL_checknumber(L, {stack_index_expr});"]
+
+    if type_info.kind == "bool":
+        return [f"{target_expr} = ({c_type}) (lua_toboolean(L, {stack_index_expr}) != 0);"]
+
+    if type_info.kind == "string":
+        return [f"{target_expr} = ({c_type}) luaL_checkstring(L, {stack_index_expr});"]
+
+    if type_info.kind == "pointer":
+        expr = render_pointer_read_expr(c_type, stack_index_expr, label)
+        return [f"{target_expr} = {expr};"]
+
+    if type_info.kind == "record":
+        helper = f"lua_ggml_check_record_{record_helper_suffix(type_info.record_name or 'record')}"
+        return [f"{target_expr} = {helper}(L, {stack_index_expr});"]
+
+    raise ValueError(f"Unsupported stack assignment kind: {type_info.kind}")
 
 
 def render_param_read_expr(type_info: TypeInfo, name: str, index: int) -> List[str]:
@@ -548,6 +726,12 @@ def render_param_read_expr(type_info: TypeInfo, name: str, index: int) -> List[s
         expr = render_pointer_read_expr(c_type, str(index), name)
         return [f"    {c_type} {name} = {expr};"]
 
+    if type_info.kind == "pointer_ref":
+        pointee = type_info.pointee_c_spelling or "void *"
+        return [
+            f"    {c_type} {name} = ({c_type}) lua_ggml_to_pointer_ref(L, {index}, \"{name}\", \"{pointee}\");"
+        ]
+
     if type_info.kind == "record":
         helper = f"lua_ggml_check_record_{record_helper_suffix(type_info.record_name or 'record')}"
         return [f"    {c_type} {name} = {helper}(L, {index});"]
@@ -561,7 +745,17 @@ def render_push_value(type_info: TypeInfo, value_expr: str) -> List[str]:
             f"    if ({value_expr} == NULL) {{",
             "        lua_pushnil(L);",
             "    } else {",
-            f"        lua_pushlightuserdata(L, (void *) {value_expr});",
+            f"        lua_ggml_push_pointer(L, (void *) {value_expr}, \"{type_info.c_spelling}\", false);",
+            "    }",
+        ]
+
+    if type_info.kind == "pointer_ref":
+        pointee = type_info.pointee_c_spelling or "void *"
+        return [
+            f"    if ({value_expr} == NULL) {{",
+            f"        lua_ggml_push_pointer_ref(L, NULL, \"{pointee}\");",
+            "    } else {",
+            f"        lua_ggml_push_pointer_ref(L, *((void **) {value_expr}), \"{pointee}\");",
             "    }",
         ]
 
@@ -590,9 +784,20 @@ def render_push_value(type_info: TypeInfo, value_expr: str) -> List[str]:
     raise ValueError(f"Unsupported push mapping kind: {type_info.kind}")
 
 
-def render_return_push(type_info: TypeInfo, value_name: str) -> List[str]:
+def render_return_push(type_info: TypeInfo, value_name: str, function_name: str) -> List[str]:
     if type_info.kind == "void":
         return ["    return 0;"]
+
+    if type_info.kind == "pointer":
+        owned = "true" if function_name in OWNED_POINTER_RETURNS else "false"
+        return [
+            f"    if ({value_name} == NULL) {{",
+            "        lua_pushnil(L);",
+            "    } else {",
+            f"        lua_ggml_push_pointer(L, (void *) {value_name}, \"{type_info.c_spelling}\", {owned});",
+            "    }",
+            "    return 1;",
+        ]
 
     lines = render_push_value(type_info, value_name)
     lines.append("    return 1;")
@@ -648,6 +853,35 @@ def render_record_reader(record: RecordInfo) -> str:
         elif field.type_info.kind == "pointer":
             expr = render_pointer_read_expr(field.type_info.c_spelling, "-1", field_label)
             lines.append(f"        value.{field.name} = {expr};")
+        elif field.type_info.kind == "pointer_ref":
+            pointee = field.type_info.pointee_c_spelling or "void *"
+            lines.append(
+                f"        value.{field.name} = ({field.type_info.c_spelling}) lua_ggml_to_pointer_ref(L, -1, \"{field_label}\", \"{pointee}\");"
+            )
+        elif field.type_info.kind == "fixed_array":
+            element_type = field.type_info.element_type
+            loop_var = f"i_{field.name}"
+            size_expr = f"(sizeof(value.{field.name}) / sizeof(value.{field.name}[0]))"
+            if element_type is None:
+                raise ValueError(f"Fixed array field missing element type: {field_label}")
+            lines.append("        luaL_checktype(L, -1, LUA_TTABLE);")
+            lines.append(f"        for (size_t {loop_var} = 0; {loop_var} < {size_expr}; ++{loop_var}) {{")
+            lines.append(f"            lua_rawgeti(L, -1, (lua_Integer) {loop_var} + 1);")
+            lines.append("            if (!lua_isnil(L, -1)) {")
+            lines.extend(
+                extra_indent(
+                    render_stack_value_assignment(
+                        element_type,
+                        f"value.{field.name}[{loop_var}]",
+                        "-1",
+                        f"{field_label}[{loop_var}]",
+                    ),
+                    3,
+                )
+            )
+            lines.append("            }")
+            lines.append("            lua_pop(L, 1);")
+            lines.append("        }")
         elif field.type_info.kind == "record":
             nested_suffix = record_helper_suffix(field.type_info.record_name or "record")
             lines.append(
@@ -665,36 +899,174 @@ def render_record_reader(record: RecordInfo) -> str:
     return "\n".join(lines)
 
 
-def render_record_pusher(record: RecordInfo) -> str:
+def render_record_filler(record: RecordInfo) -> str:
     suffix = record_helper_suffix(record.name)
     lines = [
-        f"static void lua_ggml_push_record_{suffix}(lua_State *L, {record.c_spelling} value) {{",
-        f"    lua_createtable(L, 0, {len(record.fields)});",
+        f"static void lua_ggml_fill_record_{suffix}(lua_State *L, int index, {record.c_spelling} value) {{",
+        "    int abs_index = lua_absindex(L, index);",
     ]
 
     for field in record.fields:
+        if field.type_info.kind == "fixed_array":
+            element_type = field.type_info.element_type
+            loop_var = f"i_{field.name}"
+            size_expr = f"(sizeof(value.{field.name}) / sizeof(value.{field.name}[0]))"
+            if element_type is None:
+                raise ValueError(f"Fixed array field missing element type: {record.name}.{field.name}")
+            lines.append(f"    lua_createtable(L, (int) {size_expr}, 0);")
+            lines.append(f"    for (size_t {loop_var} = 0; {loop_var} < {size_expr}; ++{loop_var}) {{")
+            lines.extend(extra_indent(render_push_value(element_type, f"value.{field.name}[{loop_var}]"), 1))
+            lines.append(f"        lua_rawseti(L, -2, (lua_Integer) {loop_var} + 1);")
+            lines.append("    }")
+            lines.append(f"    lua_setfield(L, abs_index, \"{field.name}\");")
+            continue
+
         lines.extend(render_push_value(field.type_info, f"value.{field.name}"))
-        lines.append(f"    lua_setfield(L, -2, \"{field.name}\");")
+        lines.append(f"    lua_setfield(L, abs_index, \"{field.name}\");")
 
     lines.append("}")
     return "\n".join(lines)
 
 
-def render_wrapper(fn: FuncInfo) -> str:
+def render_record_pusher(record: RecordInfo) -> str:
+    suffix = record_helper_suffix(record.name)
+    lines = [
+        f"static void lua_ggml_push_record_{suffix}(lua_State *L, {record.c_spelling} value) {{",
+        f"    lua_createtable(L, 0, {len(record.fields)});",
+        f"    lua_ggml_fill_record_{suffix}(L, -1, value);",
+    ]
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def render_wrapper(fn: FuncInfo, records: Dict[str, RecordInfo]) -> str:
     lines: List[str] = []
     wrapper_name = f"l_auto_{fn.c_name}"
+    count_param_names = {
+        ARRAY_COUNT_PARAMS[(fn.c_name, param.name)]
+        for param in fn.params
+        if (fn.c_name, param.name) in ARRAY_COUNT_PARAMS
+    }
+    param_indices = {param.name: i for i, param in enumerate(fn.params, start=1)}
+
     lines.append(f"static int {wrapper_name}(lua_State *L) {{")
 
+    for param in fn.params:
+        if param.name not in count_param_names:
+            continue
+        lines.extend(render_param_read_expr(param.type_info, param.name, param_indices[param.name]))
+
     for i, param in enumerate(fn.params, start=1):
+        if param.name in count_param_names:
+            continue
+
+        if param.type_info.kind in {"pointer_array", "string_array"}:
+            count_param_name = ARRAY_COUNT_PARAMS[(fn.c_name, param.name)]
+            allow_nil = (fn.c_name, param.name) in ALLOW_NIL_ARRAY_PARAMS
+            element_c_spelling = param.type_info.pointee_c_spelling
+            if element_c_spelling is None:
+                raise ValueError(f"Missing array element type for {fn.c_name}.{param.name}")
+
+            lines.append(f"    {param.type_info.c_spelling} {param.name} = NULL;")
+            lines.append(f"    size_t {param.name}_count = (size_t) {count_param_name};")
+            lines.append(f"    if (lua_isnil(L, {i})) {{")
+            if allow_nil:
+                lines.append(f"        {param.name} = NULL;")
+            else:
+                lines.append(f"        return luaL_argerror(L, {i}, \"{param.name} table expected\");")
+            lines.append("    } else {")
+            lines.append(f"        luaL_checktype(L, {i}, LUA_TTABLE);")
+            lines.append(f"        lua_Integer {param.name}_len = luaL_len(L, {i});")
+            lines.append(
+                f"        if ((size_t) {param.name}_len != {param.name}_count) {{"
+            )
+            lines.append(
+                f"            return luaL_error(L, \"{param.name} length must match {count_param_name} (%lld expected, got %lld)\", (long long) {param.name}_count, (long long) {param.name}_len);"
+            )
+            lines.append("        }")
+            lines.append(
+                f"        {param.name} = ({param.type_info.c_spelling}) lua_newuserdatauv(L, {param.name}_count * sizeof(*{param.name}), 0);"
+            )
+            lines.append(f"        for (size_t i_{param.name} = 0; i_{param.name} < {param.name}_count; ++i_{param.name}) {{")
+            lines.append(f"            lua_rawgeti(L, {i}, (lua_Integer) i_{param.name} + 1);")
+            if param.type_info.kind == "string_array":
+                lines.append(
+                    f"            {param.name}[i_{param.name}] = ({element_c_spelling}) luaL_checkstring(L, -1);"
+                )
+            else:
+                if allow_nil:
+                    lines.append("            if (lua_isnil(L, -1)) {")
+                    lines.append(f"                {param.name}[i_{param.name}] = NULL;")
+                    lines.append("            } else {")
+                    lines.append(
+                        f"                {param.name}[i_{param.name}] = ({element_c_spelling}) lua_ggml_to_pointer(L, -1, \"{param.name}\");"
+                    )
+                    lines.append("            }")
+                else:
+                    lines.append(
+                        f"            {param.name}[i_{param.name}] = ({element_c_spelling}) lua_ggml_to_pointer(L, -1, \"{param.name}\");"
+                    )
+            lines.append("            lua_pop(L, 1);")
+            lines.append("        }")
+            lines.append("    }")
+            continue
+
+        if param.type_info.kind == "record_pointer":
+            record_name = param.type_info.record_name or "record"
+            record = records.get(record_name)
+            if record is None:
+                raise ValueError(f"Missing record info for {fn.c_name}.{param.name}")
+            suffix = record_helper_suffix(record_name)
+            lines.append(f"    {record.c_spelling} {param.name}_storage = ({record.c_spelling}) {{0}};")
+            lines.append(f"    {param.type_info.c_spelling} {param.name} = NULL;")
+            lines.append(f"    int {param.name}_table_index = 0;")
+            lines.append(f"    if (lua_istable(L, {i})) {{")
+            lines.append(
+                f"        {param.name}_storage = lua_ggml_check_record_{suffix}(L, {i});"
+            )
+            lines.append(f"        {param.name} = &{param.name}_storage;")
+            lines.append(f"        {param.name}_table_index = lua_absindex(L, {i});")
+            lines.append("    } else {")
+            lines.append(
+                f"        {param.name} = ({param.type_info.c_spelling}) lua_ggml_to_pointer(L, {i}, \"{param.name}\");"
+            )
+            lines.append("    }")
+            continue
+
         lines.extend(render_param_read_expr(param.type_info, param.name, i))
 
     call_args = ", ".join(param.name for param in fn.params)
     if fn.return_type.kind == "void":
         lines.append(f"    {fn.c_name}({call_args});")
-        lines.extend(render_return_push(fn.return_type, ""))
+        for param in fn.params:
+            if param.type_info.kind != "record_pointer":
+                continue
+            if param.type_info.c_spelling.startswith("const "):
+                continue
+            record_name = param.type_info.record_name or "record"
+            suffix = record_helper_suffix(record_name)
+            lines.append(f"    if ({param.name}_table_index != 0) {{")
+            lines.append(
+                f"        lua_ggml_fill_record_{suffix}(L, {param.name}_table_index, *{param.name});"
+            )
+            lines.append("    }")
+        lines.extend(render_return_push(fn.return_type, "", fn.c_name))
     else:
         lines.append(f"    {fn.return_type.c_spelling} result = {fn.c_name}({call_args});")
-        lines.extend(render_return_push(fn.return_type, "result"))
+        for param in fn.params:
+            if param.type_info.kind != "record_pointer":
+                continue
+            if param.type_info.c_spelling.startswith("const "):
+                continue
+            record_name = param.type_info.record_name or "record"
+            suffix = record_helper_suffix(record_name)
+            lines.append(f"    if ({param.name}_table_index != 0) {{")
+            lines.append(
+                f"        lua_ggml_fill_record_{suffix}(L, {param.name}_table_index, *{param.name});"
+            )
+            lines.append("    }")
+        lines.extend(render_return_push(fn.return_type, "result", fn.c_name))
 
     lines.append("}")
     return "\n".join(lines)
@@ -722,35 +1094,21 @@ def render_c(
     out.append("#include <lauxlib.h>")
     for header_name in unique_headers:
         out.append(f"#include \"{header_name}\"")
+    out.append("#include \"lua_ggml_support.h\"")
     out.append(f"#include \"{header_basename}\"")
     out.append("")
-    out.extend(
-        [
-            "static void * lua_ggml_to_pointer(lua_State *L, int index, const char *name) {",
-            "    if (lua_isnil(L, index)) {",
-            "        return NULL;",
-            "    }",
-            "",
-            "    if (!lua_islightuserdata(L, index) && !lua_isuserdata(L, index)) {",
-            "        luaL_error(L, \"%s must be userdata, lightuserdata, or nil\", name);",
-            "        return NULL;",
-            "    }",
-            "",
-            "    return lua_touserdata(L, index);",
-            "}",
-            "",
-        ]
-    )
 
     for record_name in sorted(records.keys()):
         record = records[record_name]
         out.append(render_record_reader(record))
         out.append("")
+        out.append(render_record_filler(record))
+        out.append("")
         out.append(render_record_pusher(record))
         out.append("")
 
     for fn in functions:
-        out.append(render_wrapper(fn))
+        out.append(render_wrapper(fn, records))
         out.append("")
 
     out.append("static const luaL_Reg ggml_generated_funcs[] = {")
@@ -852,6 +1210,8 @@ def main() -> int:
 
     excluded = set(EXCLUDED_BY_DEFAULT)
     excluded.update(args.exclude)
+    prefixes = args.prefix or ["ggml_"]
+    strip_prefixes = args.strip_prefix or ["ggml_"]
 
     try:
         ast_roots = [load_clang_json_ast(header, args.clang_bin, args.clang_arg) for header in headers]
@@ -864,7 +1224,7 @@ def main() -> int:
 
     record_candidates = collect_record_candidates(ast_roots, typedefs)
     records = resolve_records(record_candidates)
-    functions, skipped = find_functions(ast_roots, args.prefix, excluded, records, typedefs, exported_symbols)
+    functions, skipped = find_functions(ast_roots, prefixes, strip_prefixes, excluded, records, typedefs, exported_symbols)
     constants, constant_alias_counts = find_constants(ast_roots)
 
     c_content = render_c(
