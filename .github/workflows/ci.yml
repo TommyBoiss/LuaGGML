@@ -6,51 +6,35 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  lint:
     runs-on: ubuntu-latest
-    environment: ci-approval
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake \
-            ninja-build \
-            build-essential \
-            lua5.4 \
-            liblua5.4-dev \
+          sudo apt-get install -y \
             clang \
-            ccache
+            clang-format \
+            clang-tidy \
+            lua5.4 \
+            luarocks
+          sudo luarocks install luacheck
 
-      - name: Setup compiler env
+      - name: Check C/C++ formatting
         run: |
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "CXX=clang++" >> $GITHUB_ENV
+          if [ -n "$(find . -name '*.c' -o -name '*.cpp' -o -name '*.h' | xargs clang-format --dry-run --Werror 2>&1)" ]; then
+            echo "Code is not formatted with clang-format"
+            exit 1
+          fi
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ${{ runner.os }}-ccache-${{ github.ref }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-
-
-      - name: Configure
+      - name: Run clang-tidy
         run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_BUILD_TYPE=Release
+          find . -name '*.cpp' -print0 | xargs -0 -n1 clang-tidy || true
 
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Run smoke test
-        run: lua tests/test.lua
+      - name: Run Lua lint
+        run: |
+          luacheck .

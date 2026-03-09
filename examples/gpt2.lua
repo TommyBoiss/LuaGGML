@@ -22,6 +22,7 @@ Options:
     -m, --model PATH            Path to GPT-2 GGUF model (default: models/gpt-2-117M/gpt2.gguf)
   -p, --prompt TEXT           Prompt text (approximate greedy tokenizer)
       --prompt-tokens IDS     Comma-separated token ids (recommended for exact behavior)
+      --backend NAME          Backend selection: cpu or best (default: cpu)
   -n, --n-predict N           Number of tokens to generate (default: 128)
       --n-ctx N               Runtime context length (default: 1024)
       --n-batch N             Prompt batch size (default: 8)
@@ -36,6 +37,7 @@ Options:
 Notes:
     - This script expects a GPT-2 GGUF model file.
   - Text tokenization is an approximate greedy fallback. Use --prompt-tokens for exact input ids.
+        - Use --backend best to let ggml pick the best available backend with CPU scheduler fallback.
 ]])
 end
 
@@ -60,6 +62,7 @@ local function parse_args(argv)
         model = "",
         prompt = "",
         prompt_tokens = nil,
+        backend = "cpu",
         n_predict = 128,
         n_ctx = 1024,
         n_batch = 8,
@@ -87,6 +90,9 @@ local function parse_args(argv)
         elseif a == "--prompt-tokens" then
             i = i + 1
             params.prompt_tokens = argv[i] or die("missing value for " .. a)
+        elseif a == "--backend" then
+            i = i + 1
+            params.backend = (argv[i] or die("missing value for " .. a)):lower()
         elseif a == "-n" or a == "--n-predict" then
             i = i + 1
             params.n_predict = parse_int(a, argv[i])
@@ -126,6 +132,9 @@ local function parse_args(argv)
     if params.n_predict < 0 then die("--n-predict must be >= 0") end
     if params.top_k < 0 then die("--top-k must be >= 0") end
     if params.top_p <= 0.0 or params.top_p > 1.0 then die("--top-p must be in (0, 1]") end
+    if params.backend ~= "cpu" and params.backend ~= "best" then
+        die("--backend must be one of: cpu, best")
+    end
 
     return params
 end
@@ -394,12 +403,142 @@ local function gguf_require_tensor(ctx, ...)
     die("GGUF missing required tensor (tried: " .. table.concat(names, ", ") .. ")")
 end
 
-local function gpt2_model_load(path, n_ctx_override)
+local function init_backends(mode, n_threads)
+    local backend
+    local cpu_backend = nil
+    local backends
+    local sched
+
+    ggml.backend_load_all()
+
+    if mode == "cpu" then
+        backend = ggml.backend_cpu_init()
+        if not backend then
+            die("ggml.backend_cpu_init() failed")
+        end
+        ggml.backend_cpu_set_n_threads(backend, n_threads)
+        backends = { backend }
+    elseif mode == "best" then
+        backend = ggml.backend_init_best()
+        if not backend then
+            die("ggml.backend_init_best() failed")
+        end
+
+        if ggml.backend_is_cpu(backend) then
+            ggml.backend_cpu_set_n_threads(backend, n_threads)
+            backends = { backend }
+        else
+            cpu_backend = ggml.backend_cpu_init()
+            if not cpu_backend then
+                ggml.backend_free(backend)
+                die("ggml.backend_cpu_init() failed for scheduler fallback")
+            end
+            ggml.backend_cpu_set_n_threads(cpu_backend, n_threads)
+            backends = { backend, cpu_backend }
+        end
+    else
+        die("unsupported backend mode: " .. tostring(mode))
+    end
+
+    sched = ggml.backend_sched_new(backends, nil, #backends, GPT2_MAX_NODES, false, true)
+    if not sched then
+        if cpu_backend then
+            ggml.backend_free(cpu_backend)
+        end
+        ggml.backend_free(backend)
+        die("ggml.backend_sched_new() failed")
+    end
+
+    return {
+        backend = backend,
+        cpu_backend = cpu_backend,
+        backends = backends,
+        sched = sched,
+    }
+end
+
+local function build_input_buffer(model)
+    local hp = model.hparams
+
+    model.ctx_input = ggml.init({
+        mem_size = ggml.tensor_overhead() * 2,
+        mem_buffer = nil,
+        no_alloc = true,
+    })
+    if not model.ctx_input then
+        die("ggml.init() failed for input context")
+    end
+
+    model.embd = ggml.new_tensor_1d(model.ctx_input, ggml.TYPE_I32, hp.n_ctx)
+    model.position = ggml.new_tensor_1d(model.ctx_input, ggml.TYPE_I32, hp.n_ctx)
+    ggml.set_name(model.embd, "in/embd")
+    ggml.set_name(model.position, "in/position")
+
+    model.buffer_input = ggml.backend_alloc_ctx_tensors(model.ctx_input, model.backend)
+    if not model.buffer_input then
+        die("ggml.backend_alloc_ctx_tensors() failed for input buffer")
+    end
+end
+
+local function load_model_weights(model, path)
+    local file = io.open(path, "rb")
+    local data_offset
+    local n_tensors
+    local total_size = 0
+
+    if not file then
+        die("failed to open model file: " .. path)
+    end
+
+    model.buffer_w = ggml.backend_alloc_ctx_tensors(model.ctx_w, model.backend)
+    if not model.buffer_w then
+        file:close()
+        die("ggml.backend_alloc_ctx_tensors() failed for model weights")
+    end
+    ggml.backend_buffer_set_usage(model.buffer_w, ggml.GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+
+    data_offset = ggml.gguf_get_data_offset(model.gguf_ctx)
+    n_tensors = ggml.gguf_get_n_tensors(model.gguf_ctx)
+
+    for tensor_id = 0, n_tensors - 1 do
+        local name = ggml.gguf_get_tensor_name(model.gguf_ctx, tensor_id)
+        local tensor = ggml.get_tensor(model.ctx_w, name)
+        local nbytes
+        local file_offset
+        local data
+
+        if not tensor then
+            file:close()
+            die("GGUF tensor not found in weights context: " .. tostring(name))
+        end
+
+        nbytes = ggml.nbytes(tensor)
+        file_offset = data_offset + ggml.gguf_get_tensor_offset(model.gguf_ctx, tensor_id)
+        if not file:seek("set", file_offset) then
+            file:close()
+            die("failed to seek to tensor data for " .. tostring(name))
+        end
+
+        data = file:read(nbytes)
+        if not data or #data ~= nbytes then
+            file:close()
+            die("failed to read tensor data for " .. tostring(name))
+        end
+
+        ggml.tensor_set_data(tensor, data)
+        total_size = total_size + nbytes
+    end
+
+    file:close()
+    print(string.format("gpt2_model_load: weights size = %8.2f MB", total_size / 1024.0 / 1024.0))
+end
+
+local function gpt2_model_load(path, n_ctx_override, backend_mode, n_threads)
     print(string.format("gpt2_model_load: loading GGUF model from '%s'", path))
 
     local ctx_ref = ggml.pointer_ref("struct ggml_context *")
     local gguf_ctx = ggml.gguf_init_from_file(path, {
-        no_alloc = false,
+        no_alloc = true,
         ctx = ctx_ref,
     })
     local weights_ctx
@@ -419,10 +558,15 @@ local function gpt2_model_load(path, n_ctx_override)
         layers = {},
         tensors = {},
         backend = nil,
+        cpu_backend = nil,
+        backends = nil,
+        sched = nil,
         buffer_w = nil,
         buffer_kv = nil,
+        buffer_input = nil,
         ctx_w = weights_ctx,
         ctx_kv = nil,
+        ctx_input = nil,
         gguf_ctx = gguf_ctx,
     }
     local vocab = {
@@ -467,10 +611,14 @@ local function gpt2_model_load(path, n_ctx_override)
         vocab.byte_encoder, vocab.byte_decoder = build_gpt2_byte_maps()
     end
 
-    model.backend = ggml.backend_cpu_init()
-    if not model.backend then
-        die("ggml.backend_cpu_init() failed")
+    do
+        local backend_state = init_backends(backend_mode, n_threads)
+        model.backend = backend_state.backend
+        model.cpu_backend = backend_state.cpu_backend
+        model.backends = backend_state.backends
+        model.sched = backend_state.sched
     end
+    print(string.format("gpt2_model_load: backend = %s", ggml.backend_name(model.backend)))
 
     if n_ctx_override and n_ctx_override > 0 then
         hp.n_ctx = math.min(n_ctx_override, hp.n_ctx)
@@ -502,6 +650,8 @@ local function gpt2_model_load(path, n_ctx_override)
         model.layers[i + 1] = layer
     end
 
+    load_model_weights(model, path)
+    build_input_buffer(model)
     build_kv_cache(model)
 
     return model, vocab
@@ -528,13 +678,11 @@ local function gpt2_graph(model, n_past, n_tokens)
 
     local gf = ggml.new_graph_custom(ctx, GPT2_MAX_NODES, false)
 
-    local embd = ggml.new_tensor_1d(ctx, ggml.TYPE_I32, N)
+    local embd = ggml.view_1d(ctx, model.embd, N, 0)
     ggml.set_name(embd, "embd")
-    ggml.set_input(embd)
 
-    local position = ggml.new_tensor_1d(ctx, ggml.TYPE_I32, N)
+    local position = ggml.view_1d(ctx, model.position, N, 0)
     ggml.set_name(position, "position")
-    ggml.set_input(position)
 
     local inpL = ggml.add(
         ctx,
@@ -662,36 +810,46 @@ local function gpt2_graph(model, n_past, n_tokens)
     return gf, ctx
 end
 
-local function gpt2_eval(model, allocr, n_threads, n_past, embd_inp)
+local function set_i32_tensor_data(tensor, values)
+    local packed = {}
+
+    for i = 1, #values do
+        packed[i] = string.pack("<i4", values[i])
+    end
+
+    ggml.tensor_set_data(tensor, table.concat(packed))
+end
+
+local function gpt2_eval(model, n_threads, n_past, embd_inp)
     local N = #embd_inp
     local gf, ctx = gpt2_graph(model, n_past, N)
+    local ok_alloc
 
-    local ok_alloc = ggml.gallocr_alloc_graph(allocr, gf)
+    ggml.backend_sched_reset(model.sched)
+    ok_alloc = ggml.backend_sched_alloc_graph(model.sched, gf)
     if not ok_alloc then
         ggml.free(ctx)
-        die("ggml.gallocr_alloc_graph() failed")
+        die("ggml.backend_sched_alloc_graph() failed")
     end
 
-    local embd = ggml.graph_get_tensor(gf, "embd")
-    local position = ggml.graph_get_tensor(gf, "position")
-    if not embd or not position then
-        ggml.free(ctx)
-        die("failed to fetch graph input tensors")
-    end
-
+    local positions = {}
     for i = 1, N do
-        ggml.set_i32_1d(embd, i - 1, embd_inp[i])
-        ggml.set_i32_1d(position, i - 1, n_past + i - 1)
+        positions[i] = n_past + i - 1
     end
 
-    if ggml.backend_is_cpu(model.backend) then
+    set_i32_tensor_data(model.embd, embd_inp)
+    set_i32_tensor_data(model.position, positions)
+
+    if model.cpu_backend then
+        ggml.backend_cpu_set_n_threads(model.cpu_backend, n_threads)
+    elseif ggml.backend_is_cpu(model.backend) then
         ggml.backend_cpu_set_n_threads(model.backend, n_threads)
     end
 
-    local status = ggml.backend_graph_compute(model.backend, gf)
+    local status = ggml.backend_sched_graph_compute(model.sched, gf)
     if status ~= ggml.STATUS_SUCCESS then
         ggml.free(ctx)
-        die("ggml.backend_graph_compute() failed with status " .. tostring(status))
+        die("ggml.backend_sched_graph_compute() failed with status " .. tostring(status))
     end
 
     local logits = ggml.graph_get_tensor(gf, "logits")
@@ -804,19 +962,14 @@ local function free_model(model)
         return
     end
 
-    if model.ctx_w then
-        ggml.free(model.ctx_w)
-        model.ctx_w = nil
+    if model.sched then
+        ggml.backend_sched_free(model.sched)
+        model.sched = nil
     end
 
-    if model.ctx_kv then
-        ggml.free(model.ctx_kv)
-        model.ctx_kv = nil
-    end
-
-    if model.gguf_ctx then
-        ggml.gguf_free(model.gguf_ctx)
-        model.gguf_ctx = nil
+    if model.buffer_input then
+        ggml.backend_buffer_free(model.buffer_input)
+        model.buffer_input = nil
     end
 
     if model.buffer_w then
@@ -827,6 +980,31 @@ local function free_model(model)
     if model.buffer_kv then
         ggml.backend_buffer_free(model.buffer_kv)
         model.buffer_kv = nil
+    end
+
+    if model.ctx_input then
+        ggml.free(model.ctx_input)
+        model.ctx_input = nil
+    end
+
+    if model.ctx_kv then
+        ggml.free(model.ctx_kv)
+        model.ctx_kv = nil
+    end
+
+    if model.ctx_w then
+        ggml.free(model.ctx_w)
+        model.ctx_w = nil
+    end
+
+    if model.gguf_ctx then
+        ggml.gguf_free(model.gguf_ctx)
+        model.gguf_ctx = nil
+    end
+
+    if model.cpu_backend then
+        ggml.backend_free(model.cpu_backend)
+        model.cpu_backend = nil
     end
 
     if model.backend then
@@ -846,29 +1024,36 @@ local function main(argv)
     math.randomseed(params.seed)
 
     local t_load_start_us = ggml.time_us()
-    local model, vocab = gpt2_model_load(params.model, params.n_ctx)
+    local model, vocab = gpt2_model_load(params.model, params.n_ctx, params.backend, params.n_threads)
     local t_load_us = ggml.time_us() - t_load_start_us
-
-    local allocr = ggml.gallocr_new(ggml.backend_get_default_buffer_type(model.backend))
-    if not allocr then
-        free_model(model)
-        die("ggml.gallocr_new() failed")
-    end
 
     do
         local n_tokens = math.min(model.hparams.n_ctx, params.n_batch)
         local n_past = model.hparams.n_ctx - n_tokens
         local gf, gctx = gpt2_graph(model, n_past, n_tokens)
-        local reserved = ggml.gallocr_reserve(allocr, gf)
+        local reserved = ggml.backend_sched_reserve(model.sched, gf)
+        local total_size = 0
+
         ggml.free(gctx)
         if not reserved then
-            ggml.gallocr_free(allocr)
             free_model(model)
-            die("ggml.gallocr_reserve() failed")
+            die("ggml.backend_sched_reserve() failed")
         end
 
-        local mem_size = ggml.gallocr_get_buffer_size(allocr, 0)
-        io.stderr:write(string.format("main: compute buffer size: %.2f MB\n", mem_size / 1024.0 / 1024.0))
+        for i = 1, #model.backends do
+            local backend = model.backends[i]
+            local mem_size = ggml.backend_sched_get_buffer_size(model.sched, backend)
+            total_size = total_size + mem_size
+            if #model.backends == 1 then
+                io.stderr:write(string.format("main: compute buffer size: %.2f MB\n", mem_size / 1024.0 / 1024.0))
+            elseif mem_size > 0 then
+                io.stderr:write(string.format("main: compute buffer (%s): %.2f MB\n", ggml.backend_name(backend), mem_size / 1024.0 / 1024.0))
+            end
+        end
+
+        if #model.backends > 1 then
+            io.stderr:write(string.format("main: compute buffer total: %.2f MB\n", total_size / 1024.0 / 1024.0))
+        end
     end
 
     local embd_inp = nil
@@ -881,14 +1066,12 @@ local function main(argv)
         local tok_err = nil
         embd_inp, tok_err = tokenize_prompt_greedy(vocab, params.prompt)
         if not embd_inp then
-            ggml.gallocr_free(allocr)
             free_model(model)
             die("tokenization failed for prompt: " .. tostring(tok_err))
         end
     end
 
     if #embd_inp >= model.hparams.n_ctx then
-        ggml.gallocr_free(allocr)
         free_model(model)
         die(string.format("prompt is too long: %d tokens >= n_ctx %d", #embd_inp, model.hparams.n_ctx))
     end
@@ -918,7 +1101,7 @@ local function main(argv)
             end
 
             local t0 = ggml.time_us()
-            logits = gpt2_eval(model, allocr, params.n_threads, n_past, batch)
+            logits = gpt2_eval(model, params.n_threads, n_past, batch)
             t_predict_us = t_predict_us + (ggml.time_us() - t0)
 
             n_past = n_past + #batch
@@ -953,7 +1136,7 @@ local function main(argv)
         end
 
         local t0 = ggml.time_us()
-        logits = gpt2_eval(model, allocr, params.n_threads, n_past, { id })
+        logits = gpt2_eval(model, params.n_threads, n_past, { id })
         t_predict_us = t_predict_us + (ggml.time_us() - t0)
 
         n_past = n_past + 1
@@ -971,7 +1154,6 @@ local function main(argv)
     end
     io.write(string.format("main:    total time = %8.2f ms\n", (t_main_end_us - t_main_start_us) / 1000.0))
 
-    ggml.gallocr_free(allocr)
     free_model(model)
 end
 
